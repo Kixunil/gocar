@@ -2,21 +2,21 @@ extern crate gocar;
 
 fn main() {
     let files = gocar::scan_c_files("example_c_project/src/main.c").unwrap();
-    println!("{:?}", files);
-    let need_recompile = gocar::need_recompile("example_c_project/main", &files).unwrap();
-    if need_recompile.len() == 0 {
-        println!("Binary up to date");
-        return;
-    }
-    println!("Compiling: {:?}", need_recompile);
+    //println!("{:?}", files);
+    let need_recompile = gocar::ModifiedSources::scan("example_c_project/main", &files).unwrap();
 
-    for &path in &need_recompile {
+    let mut empty = true;
+    for path in need_recompile {
+        let path = path.unwrap();
+        empty = false;
+
+        println!("Compiling: {:?}", path);
         if !std::process::Command::new("c++")
             .arg("-W")
             .arg("-Wall")
             .arg("-c")
             .arg("-o")
-            .arg(gocar::unit_to_obj(path))
+            .arg(gocar::unit_to_obj(path).unwrap())
             .arg(path)
             .spawn()
             .unwrap()
@@ -27,12 +27,17 @@ fn main() {
         }
     }
 
+    if empty {
+        println!("Binary up to date");
+        return;
+    }
+
     if !std::process::Command::new("c++")
         .arg("-W")
         .arg("-Wall")
         .arg("-o")
         .arg("example_c_project/main")
-        .args(files.iter().map(|(file, _)| gocar::unit_to_obj(file)))
+        .args(files.iter().map(|(file, _)| gocar::unit_to_obj(file).unwrap()))
         .spawn()
         .unwrap()
         .wait()

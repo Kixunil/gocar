@@ -13,16 +13,7 @@ fn drop_lf(item: io::Result<Vec<u8>>) -> io::Result<Vec<u8>> {
 
 fn filter_headers(item: &io::Result<Vec<u8>>) -> bool {
     match *item {
-        Ok(ref item) => {
-            //eprintln!("Processing {:?}", item);
-            if item.len() > 4 {
-                &item[(item.len() - 2)..] == b".h" || &item[(item.len() - 4)..] == b".hpp"
-            } else if item.len() > 2 {
-                &item[(item.len() - 2)..] == b".h"
-            } else {
-                false
-            }
-        },
+        Ok(ref item) => item.ends_with(b".h") || item.ends_with(b".hpp"),
         Err(_) => true,
     }
 }
@@ -48,56 +39,25 @@ impl<R: BufRead> Iterator for HeaderExtractor<R> {
     }
 }
 
-fn header_to_unit<P: AsRef<Path>>(path: P) -> PathBuf {
-    use std::os::unix::ffi::OsStringExt;
-    use std::ffi::OsString;
-    use std::path::Path;
+fn header_to_unit<P: AsRef<Path> + Into<PathBuf>>(path: P) -> Option<PathBuf> {
+    path.as_ref().extension()?;
+    let mut path = path.into();
+    path.set_extension("c");
 
-    let path = OsString::from(path.as_ref());
-    let mut path = path.into_vec();
-    if path.last() == Some(&b'h') {
-        path.pop();
-    } else {
-        // hpp
-        path.pop();
-        path.pop();
-        path.pop();
-    }
-
-    path.push(b'c');
-
-    let path = OsString::from_vec(path);
-    let path = if Path::new(&path).exists() {
+    Some(if path.exists() {
         path
     } else {
-        let mut path = path.into_vec();
-        path.push(b'p');
-        path.push(b'p');
-        OsString::from_vec(path)
-    };
-
-    path.into()
+        path.set_extension("cpp");
+        path
+    })
 }
 
 /// Convert path to a .c(pp) file to a path to .o file.
-pub fn unit_to_obj<P: AsRef<Path>>(path: P) -> PathBuf {
-    use std::os::unix::ffi::OsStringExt;
-    use std::ffi::OsString;
-
-    let path = OsString::from(path.as_ref());
-    let mut path = path.into_vec();
-    if path.last() == Some(&b'c') {
-        path.pop();
-    } else {
-        // cpp
-        path.pop();
-        path.pop();
-        path.pop();
-    }
-
-    path.push(b'o');
-    let path = OsString::from_vec(path);
-    path.into()
+pub fn unit_to_obj<P: AsRef<Path> + Into<PathBuf>>(path: P) -> Option<PathBuf> {
+    path.as_ref().extension()?;
+    let mut path = path.into();
+    path.set_extension("o");
+    Some(path)
 }
 
 fn get_headers<P: AsRef<Path>>(file: P) -> io::Result<Vec<PathBuf>> {
@@ -122,7 +82,14 @@ pub fn scan_c_files<P: AsRef<Path>>(root_file: P) -> io::Result<HashMap<PathBuf,
 
     while prev_file_count != scanned_files.len() {
         prev_file_count = scanned_files.len();
-        let candidates = scanned_files.iter().flat_map(|(_, headers)| headers.iter()).map(header_to_unit).filter(|file| !scanned_files.contains_key(file)).collect::<Vec<_>>();
+        let candidates = scanned_files
+            .iter()
+            .flat_map(|(_, headers)| headers.iter())
+            .map(header_to_unit)
+            .map(Option::unwrap)
+            .filter(|file| !scanned_files.contains_key(file))
+            .collect::<Vec<_>>();
+
         for (file, headers) in candidates.into_iter().map(|file| { let headers = get_headers(&file); (file, headers) }) {
             let headers = headers?;
             scanned_files.insert(file, headers);
@@ -142,28 +109,45 @@ fn is_older<P: AsRef<Path>, I: Iterator<Item=P>>(time: std::time::SystemTime, fi
     Ok(false)
 }
 
-/// Get the list of files that need recompilation
-pub fn need_recompile<'a, P: AsRef<Path>>(target: P, sources: &'a HashMap<PathBuf, Vec<PathBuf>>) -> io::Result<Vec<&'a Path>> {
-    let target_time = match std::fs::metadata(&target) {
-        Ok(metadata) => Some(metadata.modified()?),
-        Err(err) => if err.kind() == io::ErrorKind::NotFound {
-            None
-        } else {
-            return Err(err);
-        },
-    };
+/// Iterator over modified sources
+pub struct ModifiedSources<'a> {
+    target_time: Option<std::time::SystemTime>,
+    sources: std::collections::hash_map::Iter<'a, PathBuf, Vec<PathBuf>>,
+}
 
-    let mut result = Vec::new();
+impl<'a> ModifiedSources<'a> {
+    pub fn scan<P: AsRef<Path>>(target: P, sources: &'a HashMap<PathBuf, Vec<PathBuf>>) -> io::Result<Self> {
+        let target_time = match std::fs::metadata(target) {
+            Ok(metadata) => Some(metadata.modified()?),
+            Err(err) => if err.kind() == io::ErrorKind::NotFound {
+                None
+            } else {
+                return Err(err);
+            },
+        };
 
-    for (source, headers) in sources {
-        if let Some(target_time) = target_time {
-            if is_older(target_time, Some(source).into_iter().chain(headers))? {
-                result.push(source as &Path)
+        Ok(ModifiedSources {
+            target_time,
+            sources: sources.iter(),
+        })
+    }
+}
+
+impl<'a> Iterator for ModifiedSources<'a> {
+    type Item = io::Result<&'a Path>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let (source, headers) = self.sources.next()?;
+            if let Some(target_time) = self.target_time {
+                match is_older(target_time, Some(source).into_iter().chain(headers)) {
+                    Ok(true) => return Some(Ok(source)),
+                    Ok(false) => (),
+                    Err(err) => return Some(Err(err)),
+                }
+            } else {
+                return Some(Ok(source))
             }
-        } else {
-            result.push(source as &Path)
         }
     }
-
-    Ok(result)
 }
