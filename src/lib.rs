@@ -8,6 +8,8 @@ use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::ffi::OsString;
 
+mod objs;
+
 struct HeaderExtractor<R: BufRead> {
     reader: std::iter::Filter<std::iter::Map<io::Split<R>, fn(io::Result<Vec<u8>>) -> io::Result<Vec<u8>>>, fn(&io::Result<Vec<u8>>) -> bool>,
 }
