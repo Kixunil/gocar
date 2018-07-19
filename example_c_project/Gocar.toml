@@ -1,0 +1,3 @@
+[[bin]]
+name = "example"
+root_file = "src/main.c"

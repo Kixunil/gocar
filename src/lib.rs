@@ -1,7 +1,12 @@
+extern crate serde;
+#[macro_use]
+extern crate serde_derive;
+
 use std::collections::HashMap;
 use std::io;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
+use std::ffi::OsString;
 
 struct HeaderExtractor<R: BufRead> {
     reader: std::iter::Filter<std::iter::Map<io::Split<R>, fn(io::Result<Vec<u8>>) -> io::Result<Vec<u8>>>, fn(&io::Result<Vec<u8>>) -> bool>,
@@ -53,7 +58,7 @@ fn header_to_unit<P: AsRef<Path> + Into<PathBuf>>(path: P) -> Option<PathBuf> {
 }
 
 /// Convert path to a .c(pp) file to a path to .o file.
-pub fn unit_to_obj<P: AsRef<Path> + Into<PathBuf>>(path: P) -> Option<PathBuf> {
+fn unit_to_obj<P: AsRef<Path> + Into<PathBuf>>(path: P) -> Option<PathBuf> {
     path.as_ref().extension()?;
     let mut path = path.into();
     path.set_extension("o");
@@ -149,5 +154,148 @@ impl<'a> Iterator for ModifiedSources<'a> {
                 return Some(Ok(source))
             }
         }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Binary {
+    pub name: PathBuf,
+    pub root_file: PathBuf,
+    #[serde(default)]
+    pub compile_options: Vec<PathBuf>,
+    #[serde(default)]
+    pub link_options: Vec<PathBuf>,
+}
+
+impl Binary {
+    pub fn build<P: AsRef<Path>>(&self, target_dir: P, profile: &Profile) -> io::Result<()> {
+        let bin_path = target_dir.as_ref().join(&self.name);
+        let files = scan_c_files(&self.root_file)?;
+        let need_recompile = ModifiedSources::scan(&bin_path, &files)?;
+
+        let mut empty = true;
+        let mut has_cpp = false;
+        for path in need_recompile {
+            let path = path?;
+            empty = false;
+
+            let output = unit_to_obj(path).unwrap();
+            println!("   \u{1B}[32;1mCompiling\u{1B}[0m {:?}", output);
+            let (compiler, options) = if path.extension().map_or(false, |ext| ext == "c") {
+                (&profile.c_compiler, &profile.compile_options)
+            } else {
+                has_cpp = true;
+                (&profile.cpp_compiler, &profile.compile_options)
+            };
+
+            if !std::process::Command::new(compiler)
+                .args(options)
+                .args(&self.compile_options)
+                .arg("-c")
+                .arg("-o")
+                .arg(output)
+                .arg(path)
+                .spawn()?
+                .wait()?
+                .success() {
+                    return Err(io::ErrorKind::Other.into());
+            }
+        }
+
+        if empty {
+            println!("  \u{1B}[32;1mUp to date\u{1B}[0m {:?}", self.name);
+            return Ok(());
+        }
+
+        let linker = if has_cpp {
+            &profile.cpp_compiler
+        } else {
+            &profile.c_compiler
+        };
+
+        println!("     \u{1B}[32;1mLinking\u{1B}[0m {:?}", bin_path);
+        if std::process::Command::new(linker)
+            .args(&self.link_options)
+            .arg("-o")
+            .arg(&bin_path)
+            .args(files.iter().map(|(file, _)| unit_to_obj(file).unwrap()))
+            .spawn()?
+            .wait()?
+            .success() {
+                Ok(())
+        } else {
+            Err(io::ErrorKind::Other.into())
+        }
+    }
+}
+
+fn default_c_compiler() -> PathBuf {
+	std::env::var_os("CC").map_or_else(|| "cc".to_owned().into(), Into::into)
+}
+
+fn default_cpp_compiler() -> PathBuf {
+	std::env::var_os("CXX").map_or_else(|| "c++".to_owned().into(), Into::into)
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct Profile {
+    #[serde(default = "default_c_compiler")]
+    pub c_compiler: PathBuf,
+    #[serde(default = "default_cpp_compiler")]
+    pub cpp_compiler: PathBuf,
+    #[serde(default)]
+    pub compile_options: Vec<PathBuf>,
+    #[serde(default)]
+    pub link_options: Vec<PathBuf>,
+}
+
+impl Profile {
+    pub fn release() -> Self {
+        Profile {
+            c_compiler: default_c_compiler(),
+            cpp_compiler: default_cpp_compiler(),
+            compile_options: vec!["-O2".into()],
+            link_options: Vec::new(),
+        }
+    }
+
+    pub fn debug() -> Self {
+        Profile {
+            c_compiler: default_c_compiler(),
+            cpp_compiler: default_cpp_compiler(),
+            compile_options: vec!["-g".into(), "-DDEBUG".into()],
+            link_options: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Project {
+    pub bin: Vec<Binary>,
+    #[serde(default)]
+    pub profiles: std::collections::HashMap<String, Profile>,
+    #[serde(default)]
+    pub add_compile_options: Vec<PathBuf>,
+    #[serde(default)]
+    pub add_link_options: Vec<PathBuf>,
+}
+
+impl Project {
+    pub fn init_default_profiles(&mut self) {
+        self.profiles.entry("release".to_owned()).or_insert_with(Profile::release);
+        self.profiles.entry("debug".to_owned()).or_insert_with(Profile::debug);
+        for (_, profile) in &mut self.profiles {
+            profile.compile_options.extend_from_slice(&self.add_compile_options);
+            profile.link_options.extend_from_slice(&self.add_link_options);
+        }
+    }
+
+    pub fn build<P: AsRef<Path>>(&self, target_dir: P, profile: &str) -> io::Result<()> {
+        let profile = self.profiles.get(profile).ok_or(io::ErrorKind::InvalidInput)?;
+
+        for bin in &self.bin {
+            bin.build(&target_dir, &profile)?;
+        }
+        Ok(())
     }
 }

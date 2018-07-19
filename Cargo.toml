@@ -16,5 +16,7 @@ path = "src/main.rs"
 #required-features = ["build-binary"] 
 
 [dependencies]
-#toml = "0.4.5"
+toml = "0.4.5"
+serde = "1"
+serde_derive = "1"
 #clap = { version = "2.3", optional = true }
