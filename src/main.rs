@@ -19,8 +19,10 @@ fn load_config() -> gocar::Project {
 fn build(profile: &str) {
     let config = load_config();
     let target = AsRef::<std::path::Path>::as_ref("target").join(profile);
+    let current_dir = std::env::current_dir().expect("Invalid current working directory");
+
     std::fs::create_dir_all(&target).unwrap();
-    config.build(&target, profile).unwrap();
+    config.build(&target, &current_dir, profile).unwrap();
 }
 
 fn test(profile: &str) {
@@ -34,6 +36,8 @@ fn test(profile: &str) {
     let mut test_count = 0;
     let mut fail_count = 0;
 
+    let current_dir = std::env::current_dir().expect("Invalid current working directory");
+
     std::fs::create_dir_all(&target).unwrap();
     for test in std::fs::read_dir("tests").unwrap().map(Result::unwrap).map(|e| e.path()) {
         let extension_is_valid = if let Some(extension) = test.extension() {
@@ -46,14 +50,15 @@ fn test(profile: &str) {
         if extension_is_valid {
             let binary = gocar::Binary {
                 name: test_name.clone(),
-                root_file: test,
+                root_files: std::iter::once(test).collect(),
                 compile_options: vec!["-DGOCAR_INTEFRATION_TEST".into()],
                 link_options: Vec::new(),
+                ignore_files: Default::default(),
             };
 
             test_count += 1;
 
-            binary.build(&target, profile).unwrap();
+            binary.build(&target, &current_dir, profile, &config).unwrap();
             let test_binary = target.join(&test_name);
             println!("     \u{1B}[32;1mRunning\u{1B}[0m {:?}", test_binary);
 

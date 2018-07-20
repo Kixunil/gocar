@@ -2,7 +2,7 @@ extern crate serde;
 #[macro_use]
 extern crate serde_derive;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
@@ -46,17 +46,41 @@ impl<R: BufRead> Iterator for HeaderExtractor<R> {
     }
 }
 
-fn header_to_unit<P: AsRef<Path> + Into<PathBuf>>(path: P) -> Option<PathBuf> {
-    path.as_ref().extension()?;
+fn header_to_unit<'a, P: AsRef<Path> + Into<PathBuf>, I: 'a + IntoIterator<Item=&'a DetachedHeaders>>(path: P, mappings: I) -> Option<PathBuf> {
     let mut path = path.into();
     path.set_extension("c");
 
-    Some(if path.exists() {
-        path
+    let c_exists = path.exists();
+    path.set_extension("cpp");
+    if path.exists() {
+        if c_exists {
+            None
+        } else {
+            Some(path)
+        }
     } else {
-        path.set_extension("cpp");
-        path
-    })
+        if c_exists {
+            path.set_extension("c");
+            Some(path)
+        } else {
+            for mapping in mappings {
+                if let Ok(stripped) = path.strip_prefix(&mapping.includes) {
+                    let mut path = mapping.sources.join(stripped);
+                    return if path.exists() {
+                        Some(path)
+                    } else {
+                        path.set_extension("c");
+                        if path.exists() {
+                            Some(path)
+                        } else {
+                            None
+                        }
+                    };
+                }
+            }
+            None
+        }
+    }
 }
 
 /// Convert path to a .c(pp) file to a path to .o file.
@@ -67,23 +91,36 @@ fn unit_to_obj<P: AsRef<Path> + Into<PathBuf>>(path: P) -> Option<PathBuf> {
     Some(path)
 }
 
-fn get_headers<P: AsRef<Path>>(file: P) -> io::Result<Vec<PathBuf>> {
-    let mut cpp = std::process::Command::new("c++")
+fn get_headers<P: AsRef<Path>>(file: P, profile: &Profile) -> io::Result<Vec<PathBuf>> {
+    let (compiler, compiler_specific_options) = if file.as_ref().extension().map_or(false, |e| e == "c") {
+        (&profile.c_compiler, &profile.c_compile_options)
+    } else {
+        (&profile.cpp_compiler, &profile.cpp_compile_options)
+    };
+
+    let mut cpp = std::process::Command::new(compiler)
+        .args(compiler_specific_options)
+        .args(&profile.compile_options)
         .arg("-MM")
         .arg(file.as_ref())
         .stdout(std::process::Stdio::piped())
         .spawn()?;
 
     let headers = HeaderExtractor::new(io::BufReader::new(cpp.stdout.take().expect("Stdout not set")));
-    headers.collect()
+    let headers = headers.collect();
+    if !cpp.wait()?.success() {
+        return Err(io::ErrorKind::Other.into());
+    }
+    headers
 }
 
 /// Scans files in the project
-pub fn scan_c_files<P: AsRef<Path>>(root_file: P) -> io::Result<HashMap<PathBuf, Vec<PathBuf>>> {
-    let mut scanned_files = HashMap::new();
-
-    let headers = get_headers(&root_file)?;
-    scanned_files.insert(PathBuf::from(root_file.as_ref()), headers);
+pub fn scan_c_files<P: AsRef<Path> + Into<PathBuf>, I: IntoIterator<Item=P>>(root_files: I, profile: &Profile, project: &Project, ignore_files: &HashSet<PathBuf>, strip_dir: &Path) -> io::Result<HashMap<PathBuf, Vec<PathBuf>>> {
+        let detached_headers = project.detached_headers.iter().map(|mapping| Ok(DetachedHeaders { includes: mapping.includes.canonicalize()?, sources: mapping.sources.canonicalize()?})).collect::<io::Result<Vec<_>>>()?;
+    let mut scanned_files = root_files.into_iter().map(|file| {
+        println!("\u{1B}[32;1m    Scanning\u{1B}[0m {:?}", file.as_ref().strip_prefix(strip_dir).unwrap_or(file.as_ref()));
+        get_headers(&file, profile).map(|headers| (file.into(), headers))
+    }).collect::<Result<HashMap<_, _>, _>>()?;
 
     let mut prev_file_count = 0;
 
@@ -92,12 +129,24 @@ pub fn scan_c_files<P: AsRef<Path>>(root_file: P) -> io::Result<HashMap<PathBuf,
         let candidates = scanned_files
             .iter()
             .flat_map(|(_, headers)| headers.iter())
-            .map(header_to_unit)
-            .map(Option::unwrap)
+            .filter_map(|header| {
+                let unit = header_to_unit(header.canonicalize().unwrap(), &detached_headers);
+                if !project.ignore_missing_sources && unit.is_none() {
+                    panic!("Missing source for header {:?}")
+                }
+                unit
+            })
             .filter(|file| !scanned_files.contains_key(file))
+            .filter(|file| !ignore_files.contains(file))
             .collect::<Vec<_>>();
 
-        for (file, headers) in candidates.into_iter().map(|file| { let headers = get_headers(&file); (file, headers) }) {
+        let candidates = candidates.into_iter().map(|file| {
+            println!("\u{1B}[32;1m    Scanning\u{1B}[0m {:?}", file.strip_prefix(strip_dir).unwrap_or(&file));
+            let headers = get_headers(&file, profile);
+            (file, headers)
+        });
+
+        for (file, headers) in candidates {
             let headers = headers?;
             scanned_files.insert(file, headers);
         }
@@ -162,17 +211,22 @@ impl<'a> Iterator for ModifiedSources<'a> {
 #[derive(Debug, Deserialize)]
 pub struct Binary {
     pub name: PathBuf,
-    pub root_file: PathBuf,
+    pub root_files: HashSet<PathBuf>,
     #[serde(default)]
     pub compile_options: Vec<PathBuf>,
     #[serde(default)]
     pub link_options: Vec<PathBuf>,
+    #[serde(default)]
+    pub ignore_files: HashSet<PathBuf>,
 }
 
 impl Binary {
-    pub fn build<P: AsRef<Path>>(&self, target_dir: P, profile: &Profile) -> io::Result<()> {
+    pub fn build<TP: AsRef<Path>, PP: AsRef<Path>>(&self, target_dir: TP, project_dir: PP, profile: &Profile, project: &Project) -> io::Result<()> {
+        //println!("Profile: {:?}", profile);
         let bin_path = target_dir.as_ref().join(&self.name);
-        let files = scan_c_files(&self.root_file)?;
+        let strip_prefix = std::env::current_dir().unwrap_or_else(|_| PathBuf::new());
+        let ignore_files = self.ignore_files.iter().map(|path| path.canonicalize()).collect::<Result<_, _>>()?;
+        let files = scan_c_files(&self.root_files, profile, project, &ignore_files, &strip_prefix)?;
         let need_recompile = ModifiedSources::scan(&bin_path, &files)?;
 
         let mut empty = true;
@@ -181,31 +235,71 @@ impl Binary {
             let path = path?;
             empty = false;
 
-            let output = unit_to_obj(path).unwrap();
-            println!("   \u{1B}[32;1mCompiling\u{1B}[0m {:?}", output);
-            let (compiler, options) = if path.extension().map_or(false, |ext| ext == "c") {
-                (&profile.c_compiler, &profile.compile_options)
+            let output = objs::get_obj_path(&target_dir, &project_dir, unit_to_obj(path).unwrap());
+            std::fs::create_dir_all(output.parent().unwrap())?;
+            println!("   \u{1B}[32;1mCompiling\u{1B}[0m {:?}", output.strip_prefix(&strip_prefix).unwrap_or(&output));
+            let (compiler, compiler_specific_options) = if path.extension().map_or(false, |ext| ext == "c") {
+                (&profile.c_compiler, &profile.c_compile_options)
             } else {
                 has_cpp = true;
-                (&profile.cpp_compiler, &profile.compile_options)
+                (&profile.cpp_compiler, &profile.cpp_compile_options)
             };
 
             if !std::process::Command::new(compiler)
-                .args(options)
+                .args(&profile.compile_options)
+                .args(compiler_specific_options)
                 .args(&self.compile_options)
                 .arg("-c")
                 .arg("-o")
-                .arg(output)
+                .arg(&output)
                 .arg(path)
                 .spawn()?
                 .wait()?
                 .success() {
+                    print!("      \u{1B}[31;1mFailed\u{1B}[0m {:?}", compiler);
+                    for arg in &profile.compile_options {
+                        print!(" {:?}", arg);
+                    }
+                    for arg in compiler_specific_options {
+                        print!(" {:?}", arg);
+                    }
+                    for arg in &self.compile_options {
+                        print!(" {:?}", arg);
+                    }
+                    println!(" -c -o {:?} {:?}", output, path);
                     return Err(io::ErrorKind::Other.into());
+            }
+
+            if let Some(post_compile) = &project.post_compile {
+                println!("\u{1B}[32;1mPost compile\u{1B}[0m {:?}", output.strip_prefix(&strip_prefix).unwrap_or(&output));
+                if !std::process::Command::new(post_compile)
+                    .arg(&output)
+                    .arg(path)
+                    .arg(compiler)
+                    .args(&profile.compile_options)
+                    .args(compiler_specific_options)
+                    .args(&self.compile_options)
+                    .spawn()?
+                    .wait()?
+                    .success() {
+                        print!("      \u{1B}[31;1mFailed\u{1B}[0m {:?} {:?} {:?} {:?}", post_compile, output, path, compiler);
+                        for arg in &profile.compile_options {
+                            print!(" {:?}", arg);
+                        }
+                        for arg in compiler_specific_options {
+                            print!(" {:?}", arg);
+                        }
+                        for arg in &self.compile_options {
+                            print!(" {:?}", arg);
+                        }
+                        println!();
+                        return Err(io::ErrorKind::Other.into());
+                }
             }
         }
 
         if empty {
-            println!("  \u{1B}[32;1mUp to date\u{1B}[0m {:?}", self.name);
+            println!("  \u{1B}[32;1mUp to date\u{1B}[0m {:?}", bin_path.strip_prefix(&strip_prefix).unwrap_or(&bin_path));
             return Ok(());
         }
 
@@ -215,12 +309,12 @@ impl Binary {
             &profile.c_compiler
         };
 
-        println!("     \u{1B}[32;1mLinking\u{1B}[0m {:?}", bin_path);
+        println!("     \u{1B}[32;1mLinking\u{1B}[0m {:?}", bin_path.strip_prefix(&strip_prefix).unwrap_or(&bin_path));
         if std::process::Command::new(linker)
             .args(&self.link_options)
             .arg("-o")
             .arg(&bin_path)
-            .args(files.iter().map(|(file, _)| unit_to_obj(file).unwrap()))
+            .args(files.iter().map(|(file, _)| objs::get_obj_path(&target_dir, &project_dir, unit_to_obj(file).unwrap())))
             .spawn()?
             .wait()?
             .success() {
@@ -248,6 +342,10 @@ pub struct Profile {
     #[serde(default)]
     pub compile_options: Vec<PathBuf>,
     #[serde(default)]
+    pub c_compile_options: Vec<PathBuf>,
+    #[serde(default)]
+    pub cpp_compile_options: Vec<PathBuf>,
+    #[serde(default)]
     pub link_options: Vec<PathBuf>,
 }
 
@@ -257,6 +355,8 @@ impl Profile {
             c_compiler: default_c_compiler(),
             cpp_compiler: default_cpp_compiler(),
             compile_options: vec!["-O2".into()],
+            c_compile_options: Vec::new(),
+            cpp_compile_options: Vec::new(),
             link_options: Vec::new(),
         }
     }
@@ -266,20 +366,39 @@ impl Profile {
             c_compiler: default_c_compiler(),
             cpp_compiler: default_cpp_compiler(),
             compile_options: vec!["-g".into(), "-DDEBUG".into()],
+            c_compile_options: Vec::new(),
+            cpp_compile_options: Vec::new(),
             link_options: Vec::new(),
         }
     }
 }
 
 #[derive(Debug, Deserialize)]
+pub struct DetachedHeaders {
+    includes: PathBuf,
+    sources: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct Project {
+    #[serde(default)]
     pub bin: Vec<Binary>,
     #[serde(default)]
     pub profiles: std::collections::HashMap<String, Profile>,
     #[serde(default)]
     pub add_compile_options: Vec<PathBuf>,
     #[serde(default)]
+    pub add_c_compile_options: Vec<PathBuf>,
+    #[serde(default)]
+    pub add_cpp_compile_options: Vec<PathBuf>,
+    #[serde(default)]
     pub add_link_options: Vec<PathBuf>,
+    #[serde(default)]
+    pub ignore_missing_sources: bool,
+    #[serde(default)]
+    pub detached_headers: Vec<DetachedHeaders>,
+    #[serde(default)]
+    pub post_compile: Option<PathBuf>,
 }
 
 impl Project {
@@ -288,15 +407,17 @@ impl Project {
         self.profiles.entry("debug".to_owned()).or_insert_with(Profile::debug);
         for (_, profile) in &mut self.profiles {
             profile.compile_options.extend_from_slice(&self.add_compile_options);
+            profile.c_compile_options.extend_from_slice(&self.add_c_compile_options);
+            profile.cpp_compile_options.extend_from_slice(&self.add_cpp_compile_options);
             profile.link_options.extend_from_slice(&self.add_link_options);
         }
     }
 
-    pub fn build<P: AsRef<Path>>(&self, target_dir: P, profile: &str) -> io::Result<()> {
+    pub fn build<TP: AsRef<Path>, PP: AsRef<Path>>(&self, target_dir: TP, project_dir: PP, profile: &str) -> io::Result<()> {
         let profile = self.profiles.get(profile).ok_or(io::ErrorKind::InvalidInput)?;
 
         for bin in &self.bin {
-            bin.build(&target_dir, &profile)?;
+            bin.build(&target_dir, &project_dir, &profile, &self)?;
         }
         Ok(())
     }
