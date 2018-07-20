@@ -115,7 +115,7 @@ fn get_headers<P: AsRef<Path>>(file: P, profile: &Profile) -> io::Result<Vec<Pat
 }
 
 /// Scans files in the project
-pub fn scan_c_files<P: AsRef<Path> + Into<PathBuf>, I: IntoIterator<Item=P>>(root_files: I, profile: &Profile, project: &Project, ignore_files: &HashSet<PathBuf>, strip_dir: &Path) -> io::Result<HashMap<PathBuf, Vec<PathBuf>>> {
+fn scan_c_files<P: AsRef<Path> + Into<PathBuf>, I: IntoIterator<Item=P>>(root_files: I, profile: &Profile, project: &Project, ignore_files: &HashSet<PathBuf>, strip_dir: &Path) -> io::Result<HashMap<PathBuf, Vec<PathBuf>>> {
         let detached_headers = project.detached_headers.iter().map(|mapping| Ok(DetachedHeaders { includes: mapping.includes.canonicalize()?, sources: mapping.sources.canonicalize()?})).collect::<io::Result<Vec<_>>>()?;
     let mut scanned_files = root_files.into_iter().map(|file| {
         println!("\u{1B}[32;1m    Scanning\u{1B}[0m {:?}", file.as_ref().strip_prefix(strip_dir).unwrap_or(file.as_ref()));
@@ -166,7 +166,7 @@ fn is_older<P: AsRef<Path>, I: Iterator<Item=P>>(time: std::time::SystemTime, fi
 }
 
 /// Iterator over modified sources
-pub struct ModifiedSources<'a> {
+struct ModifiedSources<'a> {
     target_time: Option<std::time::SystemTime>,
     sources: std::collections::hash_map::Iter<'a, PathBuf, Vec<PathBuf>>,
 }
