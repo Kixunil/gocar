@@ -49,16 +49,28 @@ fn test(profile: &str) {
         let test_name: std::path::PathBuf = test.file_stem().unwrap().into();
         if extension_is_valid {
             let binary = gocar::Binary {
-                name: test_name.clone(),
-                root_files: std::iter::once(test).collect(),
-                compile_options: vec!["-DGOCAR_INTEFRATION_TEST".into()],
-                link_options: Vec::new(),
-                ignore_files: Default::default(),
+                target: gocar::Target {
+                    name: test_name.clone(),
+                    root_files: std::iter::once(test).collect(),
+                    compile_options: gocar::CompileOptions::debug(),
+                    link_options: Vec::new(),
+                    ignore_files: Default::default(),
+                    _phantom: Default::default(),
+                }
             };
 
             test_count += 1;
 
-            binary.build(&target, &current_dir, profile, &config).unwrap();
+            let env = gocar::BuildEnv {
+                target_dir: &target,
+                profile,
+                strip_prefix: &current_dir,
+                project_dir: &current_dir,
+                project: &config,
+                os: gocar::OsSpec::linux(),
+            };
+
+            binary.build(&env).unwrap();
             let test_binary = target.join(&test_name);
             println!("     \u{1B}[32;1mRunning\u{1B}[0m {:?}", test_binary);
 
