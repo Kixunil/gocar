@@ -131,7 +131,7 @@ fn scan_c_files<P: AsRef<Path>, I: IntoIterator<Item=P>>(root_files: I, profile:
             .filter_map(|header| {
                 let unit = header_to_unit(header.canonicalize().unwrap(), &detached_headers);
                 if !project.ignore_missing_sources && unit.is_none() {
-                    panic!("Missing source for header {:?}")
+                    panic!("Missing source for header {:?}", header)
                 }
                 unit
             })
