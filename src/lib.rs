@@ -113,7 +113,7 @@ fn get_headers<P: AsRef<Path>>(file: P, profile: &Profile) -> io::Result<Vec<Pat
 }
 
 /// Scans files in the project
-fn scan_c_files<P: AsRef<Path>, I: IntoIterator<Item=P>>(root_files: I, profile: &Profile, project: &Project, ignore_files: &HashSet<PathBuf>, strip_dir: &Path) -> io::Result<HashMap<PathBuf, Vec<PathBuf>>> {
+fn scan_c_files<P: AsRef<Path>, I: IntoIterator<Item=P>>(root_files: I, profile: &Profile, project: &Project, ignore_files: &HashSet<PathBuf>, headers_only: &HashSet<PathBuf>, strip_dir: &Path) -> io::Result<HashMap<PathBuf, Vec<PathBuf>>> {
         let detached_headers = project.detached_headers.iter().map(|mapping| Ok(DetachedHeaders { includes: mapping.includes.canonicalize()?, sources: mapping.sources.canonicalize()?})).collect::<io::Result<Vec<_>>>()?;
     let mut scanned_files = root_files.into_iter().map(|file| {
         let file = file.as_ref().canonicalize()?;
@@ -129,11 +129,16 @@ fn scan_c_files<P: AsRef<Path>, I: IntoIterator<Item=P>>(root_files: I, profile:
             .iter()
             .flat_map(|(_, headers)| headers.iter())
             .filter_map(|header| {
-                let unit = header_to_unit(header.canonicalize().unwrap(), &detached_headers);
-                if !project.ignore_missing_sources && unit.is_none() {
-                    panic!("Missing source for header {:?}", header)
+                let canonicalized = header.canonicalize().unwrap();
+                if headers_only.contains(&canonicalized) {
+                    None
+                } else {
+                    let unit = header_to_unit(canonicalized, &detached_headers);
+                    if !project.ignore_missing_sources && unit.is_none() {
+                        panic!("Missing source for header {:?}", header)
+                    }
+                    unit
                 }
-                unit
             })
             .filter(|file| !scanned_files.contains_key(file))
             .filter(|file| !ignore_files.contains(file))
@@ -304,6 +309,7 @@ pub struct BuildEnv<'a> {
     pub os: OsSpec,
     pub profile: &'a Profile,
     pub project: &'a Project,
+    pub headers_only: &'a HashSet<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -372,7 +378,7 @@ pub struct Target<K: TargetKind> {
 impl<K: TargetKind> Target<K> {
     fn compile(&self, env: &BuildEnv, skip_older: Option<SystemTime>, spec: &TargetSpec) -> io::Result<CompileOutput> {
         let ignore_files = self.ignore_files.iter().map(|path| path.canonicalize()).collect::<Result<_, _>>()?;
-        let files = scan_c_files(&self.root_files, env.profile, env.project, &ignore_files, &env.strip_prefix)?;
+        let files = scan_c_files(&self.root_files, env.profile, env.project, &ignore_files, env.headers_only, &env.strip_prefix)?;
 
         let mut up_to_date = true;
         let mut has_cpp = false;
@@ -634,6 +640,8 @@ pub struct Project {
     pub detached_headers: Vec<DetachedHeaders>,
     #[serde(default)]
     pub post_compile: Option<PathBuf>,
+    #[serde(default)]
+    pub headers_only: HashSet<PathBuf>,
 }
 
 impl Project {
@@ -651,6 +659,7 @@ impl Project {
     pub fn build<TP: AsRef<Path>, PP: AsRef<Path>>(&self, target_dir: TP, project_dir: PP, profile: &str) -> io::Result<()> {
         let profile = self.profiles.get(profile).ok_or(io::ErrorKind::InvalidInput)?;
         let strip_prefix = std::env::current_dir().unwrap_or_else(|_| PathBuf::new());
+        let headers_only = self.headers_only.iter().map(|path| path.canonicalize()).collect::<Result<_, _>>()?;
 
         let env = BuildEnv {
             target_dir: target_dir.as_ref(),
@@ -658,6 +667,7 @@ impl Project {
             profile,
             project: self,
             strip_prefix: &strip_prefix,
+            headers_only: &headers_only,
             os: OsSpec::linux(),
         };
 

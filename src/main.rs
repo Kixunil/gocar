@@ -28,6 +28,7 @@ fn build(profile: &str) {
 fn test(profile: &str) {
     let config = load_config();
 
+    let headers_only = config.headers_only.iter().map(|path| path.canonicalize()).collect::<Result<_, _>>().expect("Failed to canonicalize headers_only");
     let mut target = AsRef::<std::path::Path>::as_ref("target").join(profile);
     target.push("integration_tests");
     let profile = config.profiles.get(profile).expect("unknown profile");
@@ -67,6 +68,7 @@ fn test(profile: &str) {
                 strip_prefix: &current_dir,
                 project_dir: &current_dir,
                 project: &config,
+                headers_only: &headers_only,
                 os: gocar::OsSpec::linux(),
             };
 
