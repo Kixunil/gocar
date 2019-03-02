@@ -82,6 +82,15 @@ fn canonicalize<P: AsRef<Path> + Into<PathBuf>>(path: P) -> FsResult<PathBuf> {
     path.as_ref().canonicalize().err_ctx(|| (path.into(), "canonicalize"))
 }
 
+fn canonicalize_custom_wd<P: AsRef<Path> + Into<PathBuf>, WD: AsRef<Path>>(path: P, working_dir: WD) -> FsResult<PathBuf> {
+    if path.as_ref().is_relative() {
+        let path = working_dir.as_ref().join(path);
+        path.canonicalize().err_ctx(|| (path, "canonicalize"))
+    } else {
+        path.as_ref().canonicalize().err_ctx(|| (path.into(), "canonicalize"))
+    }
+}
+
 struct HeaderExtractor<R: BufRead> {
     reader: std::iter::Filter<std::iter::Map<io::Split<R>, fn(io::Result<Vec<u8>>) -> io::Result<Vec<u8>>>, fn(&io::Result<Vec<u8>>) -> bool>,
 }
@@ -184,15 +193,10 @@ fn get_headers<P: AsRef<Path>>(file: P, profile: &Profile) -> io::Result<Vec<Pat
 }
 
 /// Scans files in the project
-fn scan_c_files<P: AsRef<Path>, I: IntoIterator<Item=P>>(root_files: I, profile: &Profile, project: &Project, ignore_files: &HashSet<PathBuf>, headers_only: &HashSet<PathBuf>, strip_dir: &Path, project_dir: &Path) -> GocarResult<HashMap<PathBuf, Vec<PathBuf>>> {
-        let detached_headers = project.detached_headers.iter().map(|mapping| Ok(DetachedHeaders { includes: canonicalize(&mapping.includes)?, sources: canonicalize(&mapping.sources)?})).collect::<FsResult<Vec<_>>>()?;
+fn scan_c_files<P: AsRef<Path> + Into<PathBuf>, I: IntoIterator<Item=P>>(root_files: I, profile: &Profile, project: &Project, ignore_files: &HashSet<PathBuf>, headers_only: &HashSet<PathBuf>, strip_dir: &Path, project_dir: &Path) -> GocarResult<HashMap<PathBuf, Vec<PathBuf>>> {
+        let detached_headers = project.detached_headers.iter().map(|mapping| Ok(DetachedHeaders { includes: canonicalize_custom_wd(&mapping.includes, project_dir)?, sources: canonicalize_custom_wd(&mapping.sources, project_dir)?})).collect::<FsResult<Vec<_>>>()?;
     let mut scanned_files = root_files.into_iter().map(|file: _| -> GocarResult<_> {
-        let file = if file.as_ref().is_relative() {
-            let file = project_dir.join(&file);
-            canonicalize(file)?
-        } else {
-            canonicalize(file.as_ref())?
-        };
+        let file = canonicalize_custom_wd(file, project_dir)?;
 
         println!("\u{1B}[32;1m    Scanning\u{1B}[0m {:?}", file.strip_prefix(strip_dir).unwrap_or(&file));
         get_headers(&file, profile).map(|headers| (file, headers)).map_err(Into::into)
@@ -206,7 +210,7 @@ fn scan_c_files<P: AsRef<Path>, I: IntoIterator<Item=P>>(root_files: I, profile:
             .iter()
             .flat_map(|(_, headers)| headers.iter())
             .filter_map(|header| {
-                let canonicalized = canonicalize(header).unwrap();
+                let canonicalized = canonicalize_custom_wd(header, project_dir).unwrap();
                 if headers_only.contains(&canonicalized) {
                     None
                 } else {
@@ -811,7 +815,7 @@ impl Project {
         let profile = self.profiles.get(profile_name).ok_or(Error::InvalidProfileName)?;
         let (include_dir, lib_dirs, libs) = self.build_dependencies(target_dir, project_dir, profile_name, linkage)?;
         let strip_prefix = std::env::current_dir().unwrap_or_else(|_| PathBuf::new());
-        let headers_only = self.headers_only.iter().map(canonicalize).collect::<Result<_, _>>()?;
+        let headers_only = self.headers_only.iter().map(|path| canonicalize_custom_wd(path, project_dir)).collect::<Result<_, _>>()?;
 
         let env = BuildEnv {
             target_dir: target_dir,
