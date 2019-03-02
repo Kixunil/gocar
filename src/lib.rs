@@ -173,12 +173,13 @@ fn unit_to_obj<P: AsRef<Path> + Into<PathBuf>>(path: P) -> Option<PathBuf> {
     Some(path)
 }
 
-fn get_headers<P: AsRef<Path> + Into<PathBuf>>(file: P, profile: &Profile) -> GocarResult<Vec<PathBuf>> {
+fn get_headers<P: AsRef<Path> + Into<PathBuf>>(file: P, env: &BuildEnv) -> GocarResult<Vec<PathBuf>> {
     let compiler = Compiler::determine_from_file(&file).expect("Unknown extension");
-    let options = profile.compile_options.all(compiler);
-    let compiler = profile.compiler(compiler);
+    let options = env.profile.compile_options.all(compiler);
+    let compiler = env.profile.compiler(compiler);
 
     let mut cpp = std::process::Command::new(compiler)
+        .args(env.include_dirs)
         .args(options.clone())
         .arg("-MM")
         .arg(file.as_ref())
@@ -192,6 +193,7 @@ fn get_headers<P: AsRef<Path> + Into<PathBuf>>(file: P, profile: &Profile) -> Go
         let size = max.unwrap_or(min);
         let mut cmdline: Vec<OsString> = Vec::with_capacity(size + 3);
         cmdline.push(compiler.into());
+        cmdline.extend(env.include_dirs.iter().map(Into::into));
         cmdline.extend(options.map(Into::into));
         cmdline.push("-MM".into());
         cmdline.push(file.into().into());
@@ -201,13 +203,13 @@ fn get_headers<P: AsRef<Path> + Into<PathBuf>>(file: P, profile: &Profile) -> Go
 }
 
 /// Scans files in the project
-fn scan_c_files<P: AsRef<Path> + Into<PathBuf>, I: IntoIterator<Item=P>>(root_files: I, profile: &Profile, project: &Project, ignore_files: &HashSet<PathBuf>, headers_only: &HashSet<PathBuf>, strip_dir: &Path, project_dir: &Path) -> GocarResult<HashMap<PathBuf, Vec<PathBuf>>> {
-        let detached_headers = project.detached_headers.iter().map(|mapping| Ok(DetachedHeaders { includes: canonicalize_custom_wd(&mapping.includes, project_dir)?, sources: canonicalize_custom_wd(&mapping.sources, project_dir)?})).collect::<FsResult<Vec<_>>>()?;
+fn scan_c_files<P: AsRef<Path> + Into<PathBuf>, I: IntoIterator<Item=P>>(root_files: I, ignore_files: &HashSet<PathBuf>, env: &BuildEnv) -> GocarResult<HashMap<PathBuf, Vec<PathBuf>>> {
+        let detached_headers = env.project.detached_headers.iter().map(|mapping| Ok(DetachedHeaders { includes: canonicalize_custom_wd(&mapping.includes, env.project_dir)?, sources: canonicalize_custom_wd(&mapping.sources, env.project_dir)?})).collect::<FsResult<Vec<_>>>()?;
     let mut scanned_files = root_files.into_iter().map(|file: _| -> GocarResult<_> {
-        let file = canonicalize_custom_wd(file, project_dir)?;
+        let file = canonicalize_custom_wd(file, env.project_dir)?;
 
-        println!("\u{1B}[32;1m    Scanning\u{1B}[0m {:?}", file.strip_prefix(strip_dir).unwrap_or(&file));
-        get_headers(&file, profile).map(|headers| (file, headers)).map_err(Into::into)
+        println!("\u{1B}[32;1m    Scanning\u{1B}[0m {:?}", file.strip_prefix(env.project_dir).unwrap_or(&file));
+        get_headers(&file, env).map(|headers| (file, headers)).map_err(Into::into)
     }).collect::<Result<HashMap<_, _>, _>>()?;
 
     let mut prev_file_count = 0;
@@ -218,12 +220,12 @@ fn scan_c_files<P: AsRef<Path> + Into<PathBuf>, I: IntoIterator<Item=P>>(root_fi
             .iter()
             .flat_map(|(_, headers)| headers.iter())
             .filter_map(|header| {
-                let canonicalized = canonicalize_custom_wd(header, project_dir).unwrap();
-                if headers_only.contains(&canonicalized) {
+                let canonicalized = canonicalize_custom_wd(header, env.project_dir).unwrap();
+                if env.headers_only.contains(&canonicalized) {
                     None
                 } else {
                     let unit = header_to_unit(canonicalized, &detached_headers);
-                    if !project.ignore_missing_sources && unit.is_none() {
+                    if !env.project.ignore_missing_sources && unit.is_none() {
                         panic!("Missing source for header {:?}", header)
                     }
                     unit
@@ -234,8 +236,8 @@ fn scan_c_files<P: AsRef<Path> + Into<PathBuf>, I: IntoIterator<Item=P>>(root_fi
             .collect::<Vec<_>>();
 
         let candidates = candidates.into_iter().map(|file| {
-            println!("\u{1B}[32;1m    Scanning\u{1B}[0m {:?}", file.strip_prefix(strip_dir).unwrap_or(&file));
-            let headers = get_headers(&file, profile);
+            println!("\u{1B}[32;1m    Scanning\u{1B}[0m {:?}", file.strip_prefix(env.project_dir).unwrap_or(&file));
+            let headers = get_headers(&file, env);
             (file, headers)
         });
 
@@ -396,6 +398,7 @@ pub struct BuildEnv<'a> {
     pub project_dir: &'a Path,
     pub target_dir: &'a Path,
     pub include_dir: &'a Path,
+    pub include_dirs: &'a [OsString],
     pub lib_dirs: &'a [OsString],
     pub libs: &'a [OsString],
     pub strip_prefix: &'a Path,
@@ -472,7 +475,7 @@ pub struct Target<K: TargetKind> {
 impl<K: TargetKind> Target<K> {
     fn compile(&self, env: &BuildEnv, skip_older: Option<SystemTime>, spec: &TargetSpec) -> GocarResult<CompileOutput> {
         let ignore_files = self.ignore_files.iter().map(canonicalize).collect::<Result<_, _>>()?;
-        let files = scan_c_files(&self.root_files, env.profile, env.project, &ignore_files, env.headers_only, &env.strip_prefix, &env.project_dir)?;
+        let files = scan_c_files(&self.root_files, &ignore_files, env)?;
 
         let mut up_to_date = true;
         let mut has_cpp = false;
@@ -497,6 +500,7 @@ impl<K: TargetKind> Target<K> {
             let compiler = env.profile.compiler(compiler);
 
             if !std::process::Command::new(compiler)
+                .args(env.include_dirs)
                 .args(compile_options.clone())
                 .arg("-c")
                 .arg("-o")
@@ -505,12 +509,18 @@ impl<K: TargetKind> Target<K> {
                 .spawn()?
                 .wait()?
                 .success() {
-                    print!("      \u{1B}[31;1mFailed\u{1B}[0m {:?}", compiler);
-                    for arg in compile_options.clone() {
-                        print!(" {:?}", arg);
-                    }
-                    println!(" -c -o {:?} {:?}", output, path);
-                    return Err(io::Error::from(io::ErrorKind::Other).into());
+                    let (min, max) = compile_options.size_hint();
+                    let len = max.unwrap_or(min) + env.include_dirs.len() + 5;
+                    let mut cmdline: Vec<OsString> = Vec::with_capacity(len);
+                    cmdline.push(compiler.into());
+                    cmdline.extend(env.include_dirs.iter().map(Into::into));
+                    cmdline.extend(compile_options.clone().map(Into::into));
+                    cmdline.push("-c".into());
+                    cmdline.push("-o".into());
+                    cmdline.push(output.into());
+                    cmdline.push(path.into());
+
+                    return Err(Error::CompileError(cmdline));
             }
 
             if let Some(post_compile) = &env.project.post_compile {
@@ -519,16 +529,22 @@ impl<K: TargetKind> Target<K> {
                     .arg(&output)
                     .arg(path)
                     .arg(compiler)
+                    .args(env.include_dirs)
                     .args(compile_options.clone())
                     .spawn()?
                     .wait()?
                     .success() {
-                        print!("      \u{1B}[31;1mFailed\u{1B}[0m {:?} {:?} {:?} {:?}", post_compile, output, path, compiler);
-                        for arg in compile_options {
-                            print!(" {:?}", arg);
-                        }
-                        println!();
-                        return Err(io::Error::from(io::ErrorKind::Other).into());
+                        let (min, max) = compile_options.size_hint();
+                        let len = max.unwrap_or(min) + env.include_dirs.len() + 4;
+                        let mut cmdline: Vec<OsString> = Vec::with_capacity(len);
+                        cmdline.push(post_compile.into());
+                        cmdline.push(output.into());
+                        cmdline.push(path.into());
+                        cmdline.push(compiler.into());
+                        cmdline.extend(env.include_dirs.iter().map(Into::into));
+                        cmdline.extend(compile_options.clone().map(Into::into));
+
+                        return Err(Error::CompileError(cmdline));
                 }
             }
         }
@@ -758,6 +774,8 @@ pub struct Project {
     pub headers_only: HashSet<PathBuf>,
     #[serde(default)]
     pub dependencies: HashMap<String, Dependency>,
+    #[serde(default)]
+    pub include_dirs: Vec<PathBuf>,
 }
 
 impl Project {
@@ -824,11 +842,21 @@ impl Project {
         let (include_dir, lib_dirs, libs) = self.build_dependencies(target_dir, project_dir, profile_name, linkage)?;
         let strip_prefix = std::env::current_dir().unwrap_or_else(|_| PathBuf::new());
         let headers_only = self.headers_only.iter().map(|path| canonicalize_custom_wd(path, project_dir)).collect::<Result<_, _>>()?;
+        let include_dirs = self.include_dirs
+            .iter()
+            .map(|path| canonicalize_custom_wd(path, project_dir))
+            .map(|dir| dir.map(|dir| {
+                let mut opt = OsString::from("-I");
+                opt.push(dir);
+                opt
+            }))
+            .collect::<Result<Vec<_>, _>>()?;
 
         let env = BuildEnv {
             target_dir: target_dir,
             project_dir: project_dir,
             include_dir: &include_dir,
+            include_dirs: &include_dirs,
             lib_dirs: &lib_dirs,
             libs: &libs,
             profile,

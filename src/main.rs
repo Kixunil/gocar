@@ -80,6 +80,7 @@ fn test(profile_name: &str) {
             let env = gocar::BuildEnv {
                 target_dir: &target,
                 include_dir: &include_dir,
+                include_dirs: &[],
                 lib_dirs: &lib_dirs,
                 libs: &libs,
                 profile,
