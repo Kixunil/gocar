@@ -32,6 +32,7 @@ pub enum Error {
     Filesystem(FsError),
     Unspecified(io::Error),
     InvalidProfileName,
+    CompileError(Vec<OsString>),
 }
 
 impl From<io::Error> for Error {
@@ -172,22 +173,29 @@ fn unit_to_obj<P: AsRef<Path> + Into<PathBuf>>(path: P) -> Option<PathBuf> {
     Some(path)
 }
 
-fn get_headers<P: AsRef<Path>>(file: P, profile: &Profile) -> io::Result<Vec<PathBuf>> {
+fn get_headers<P: AsRef<Path> + Into<PathBuf>>(file: P, profile: &Profile) -> GocarResult<Vec<PathBuf>> {
     let compiler = Compiler::determine_from_file(&file).expect("Unknown extension");
     let options = profile.compile_options.all(compiler);
     let compiler = profile.compiler(compiler);
 
     let mut cpp = std::process::Command::new(compiler)
-        .args(options)
+        .args(options.clone())
         .arg("-MM")
         .arg(file.as_ref())
         .stdout(std::process::Stdio::piped())
         .spawn()?;
 
     let headers = HeaderExtractor::new(io::BufReader::new(cpp.stdout.take().expect("Stdout not set")));
-    let headers = headers.collect();
+    let headers = headers.collect::<Result<_, _>>().map_err(Into::into);
     if !cpp.wait()?.success() {
-        return Err(io::ErrorKind::Other.into());
+        let (min, max) = options.size_hint();
+        let size = max.unwrap_or(min);
+        let mut cmdline: Vec<OsString> = Vec::with_capacity(size + 3);
+        cmdline.push(compiler.into());
+        cmdline.extend(options.map(Into::into));
+        cmdline.push("-MM".into());
+        cmdline.push(file.into().into());
+        return Err(Error::CompileError(cmdline));
     }
     headers
 }

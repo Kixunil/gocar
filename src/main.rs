@@ -22,7 +22,19 @@ fn build(profile: &str) {
     let current_dir = std::env::current_dir().expect("Invalid current working directory");
 
     std::fs::create_dir_all(&target).unwrap();
-    config.build(&target, &current_dir, profile, gocar::LibraryType::Static).unwrap();
+    match config.build(&target, &current_dir, profile, gocar::LibraryType::Static) {
+        Ok(()) => (),
+        Err(gocar::Error::CompileError(cmdline)) => {
+            print!("      \u{1B}[31;1mFailed\u{1B}[0m");
+            for arg in &cmdline {
+                print!(" {:?}", arg);
+            }
+            println!();
+        },
+        Err(gocar::Error::Filesystem(err)) => println!("      \u{1B}[31;1mError\u{1B}[0m: {}", err),
+        Err(gocar::Error::Unspecified(err)) => println!("      \u{1B}[31;1mError\u{1B}[0m: {}", err),
+        Err(gocar::Error::InvalidProfileName) => println!("      \u{1B}[31;1mError\u{1B}[0m: invalid profile name"),
+    }
 }
 
 fn test(profile_name: &str) {
