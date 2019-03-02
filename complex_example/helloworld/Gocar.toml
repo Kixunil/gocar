@@ -1,0 +1,8 @@
+[[bin]]
+name = "helloworld"
+root_files = ["src/main.c"]
+c_flags = ["-Itarget/debug/deps/include"]
+link_flags = ["-Ltarget/debug/deps/lib/"]
+
+[dependencies]
+libmessage = { "path" = "../libmessage" }

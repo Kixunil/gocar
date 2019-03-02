@@ -8,8 +8,79 @@ use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::ffi::{OsString, OsStr};
 use std::time::SystemTime;
+use std::fmt;
 
 mod objs;
+
+#[derive(Debug)]
+pub struct FsError {
+    path: PathBuf,
+    error: io::Error,
+    operation: &'static str,
+}
+
+impl fmt::Display for FsError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+       write!(f, "failed to {} {}: {}", self.operation, self.path.display(), self.error)
+    }
+}
+
+type FsResult<T> = Result<T, FsError>;
+
+#[derive(Debug)]
+pub enum Error {
+    Filesystem(FsError),
+    Unspecified(io::Error),
+    InvalidProfileName,
+}
+
+impl From<io::Error> for Error {
+    fn from(value: io::Error) -> Error {
+       Error::Unspecified(value)
+    }
+}
+
+impl From<FsError> for Error {
+    fn from(value: FsError) -> Error {
+       Error::Filesystem(value)
+    }
+}
+
+type GocarResult<T> = Result<T, Error>;
+
+trait ResultExt: Sized {
+    type Item: Sized;
+
+    fn err_ctx<F: FnOnce() -> (PathBuf, &'static str)>(self, f: F) -> FsResult<Self::Item>;
+}
+
+impl<T> ResultExt for io::Result<T> {
+    type Item = T;
+
+    fn err_ctx<F: FnOnce() -> (PathBuf, &'static str)>(self, f: F) -> FsResult<Self::Item> {
+        self.map_err(|error| {
+            let (path, operation) = f();
+
+            FsError {
+                path,
+                error,
+                operation,
+            }
+        })
+    }
+}
+
+fn file_open<P: AsRef<Path> + Into<PathBuf>>(path: P) -> FsResult<std::fs::File> {
+    std::fs::File::open(&path).err_ctx(|| (path.into(), "open file"))
+}
+
+fn create_dir_all<P: AsRef<Path> + Into<PathBuf>>(path: P) -> FsResult<()> {
+    std::fs::create_dir_all(&path).err_ctx(|| (path.into(), "create directory structure"))
+}
+
+fn canonicalize<P: AsRef<Path> + Into<PathBuf>>(path: P) -> FsResult<PathBuf> {
+    path.as_ref().canonicalize().err_ctx(|| (path.into(), "canonicalize"))
+}
 
 struct HeaderExtractor<R: BufRead> {
     reader: std::iter::Filter<std::iter::Map<io::Split<R>, fn(io::Result<Vec<u8>>) -> io::Result<Vec<u8>>>, fn(&io::Result<Vec<u8>>) -> bool>,
@@ -113,12 +184,18 @@ fn get_headers<P: AsRef<Path>>(file: P, profile: &Profile) -> io::Result<Vec<Pat
 }
 
 /// Scans files in the project
-fn scan_c_files<P: AsRef<Path>, I: IntoIterator<Item=P>>(root_files: I, profile: &Profile, project: &Project, ignore_files: &HashSet<PathBuf>, headers_only: &HashSet<PathBuf>, strip_dir: &Path) -> io::Result<HashMap<PathBuf, Vec<PathBuf>>> {
-        let detached_headers = project.detached_headers.iter().map(|mapping| Ok(DetachedHeaders { includes: mapping.includes.canonicalize()?, sources: mapping.sources.canonicalize()?})).collect::<io::Result<Vec<_>>>()?;
-    let mut scanned_files = root_files.into_iter().map(|file| {
-        let file = file.as_ref().canonicalize()?;
+fn scan_c_files<P: AsRef<Path>, I: IntoIterator<Item=P>>(root_files: I, profile: &Profile, project: &Project, ignore_files: &HashSet<PathBuf>, headers_only: &HashSet<PathBuf>, strip_dir: &Path, project_dir: &Path) -> GocarResult<HashMap<PathBuf, Vec<PathBuf>>> {
+        let detached_headers = project.detached_headers.iter().map(|mapping| Ok(DetachedHeaders { includes: canonicalize(&mapping.includes)?, sources: canonicalize(&mapping.sources)?})).collect::<FsResult<Vec<_>>>()?;
+    let mut scanned_files = root_files.into_iter().map(|file: _| -> GocarResult<_> {
+        let file = if file.as_ref().is_relative() {
+            let file = project_dir.join(&file);
+            canonicalize(file)?
+        } else {
+            canonicalize(file.as_ref())?
+        };
+
         println!("\u{1B}[32;1m    Scanning\u{1B}[0m {:?}", file.strip_prefix(strip_dir).unwrap_or(&file));
-        get_headers(&file, profile).map(|headers| (file, headers))
+        get_headers(&file, profile).map(|headers| (file, headers)).map_err(Into::into)
     }).collect::<Result<HashMap<_, _>, _>>()?;
 
     let mut prev_file_count = 0;
@@ -129,7 +206,7 @@ fn scan_c_files<P: AsRef<Path>, I: IntoIterator<Item=P>>(root_files: I, profile:
             .iter()
             .flat_map(|(_, headers)| headers.iter())
             .filter_map(|header| {
-                let canonicalized = header.canonicalize().unwrap();
+                let canonicalized = canonicalize(header).unwrap();
                 if headers_only.contains(&canonicalized) {
                     None
                 } else {
@@ -184,11 +261,12 @@ impl<'a> ModifiedSources<'a> {
     }
 }
 
-fn get_file_mtime<P: AsRef<Path>>(file: P) -> io::Result<Option<SystemTime>> {
-    match std::fs::metadata(file) {
-        Ok(metadata) => Ok(Some(metadata.modified()?)),
+fn get_file_mtime<P: AsRef<Path>>(file: P) -> FsResult<Option<SystemTime>> {
+    match std::fs::metadata(&file) {
+        Ok(metadata) => Ok(Some(metadata.modified().err_ctx(|| (file.as_ref().to_owned(), "get modification time of"))?)),
         Err(err) => if err.kind() == io::ErrorKind::NotFound { Ok(None) } else { Err(err) },
     }
+    .err_ctx(|| (file.as_ref().to_owned(), "get metadata of"))
 }
 
 impl<'a> Iterator for ModifiedSources<'a> {
@@ -305,6 +383,9 @@ impl OsSpec {
 pub struct BuildEnv<'a> {
     pub project_dir: &'a Path,
     pub target_dir: &'a Path,
+    pub include_dir: &'a Path,
+    pub lib_dirs: &'a [OsString],
+    pub libs: &'a [OsString],
     pub strip_prefix: &'a Path,
     pub os: OsSpec,
     pub profile: &'a Profile,
@@ -336,6 +417,7 @@ impl TargetKind for BinTarget {
     }
 }
 
+#[derive(Copy, Clone, Debug, Deserialize)]
 pub enum LibraryType {
     Static,
     Dynamic,
@@ -376,9 +458,9 @@ pub struct Target<K: TargetKind> {
 }
 
 impl<K: TargetKind> Target<K> {
-    fn compile(&self, env: &BuildEnv, skip_older: Option<SystemTime>, spec: &TargetSpec) -> io::Result<CompileOutput> {
-        let ignore_files = self.ignore_files.iter().map(|path| path.canonicalize()).collect::<Result<_, _>>()?;
-        let files = scan_c_files(&self.root_files, env.profile, env.project, &ignore_files, env.headers_only, &env.strip_prefix)?;
+    fn compile(&self, env: &BuildEnv, skip_older: Option<SystemTime>, spec: &TargetSpec) -> GocarResult<CompileOutput> {
+        let ignore_files = self.ignore_files.iter().map(canonicalize).collect::<Result<_, _>>()?;
+        let files = scan_c_files(&self.root_files, env.profile, env.project, &ignore_files, env.headers_only, &env.strip_prefix, &env.project_dir)?;
 
         let mut up_to_date = true;
         let mut has_cpp = false;
@@ -387,11 +469,19 @@ impl<K: TargetKind> Target<K> {
             up_to_date = false;
 
             let output = objs::get_obj_path(&env.target_dir, &env.project_dir, unit_to_obj(path).unwrap());
-            std::fs::create_dir_all(output.parent().unwrap())?;
+            create_dir_all(output.parent().unwrap())?;
             println!("   \u{1B}[32;1mCompiling\u{1B}[0m {:?}", output.strip_prefix(&env.strip_prefix).unwrap_or(&output));
             let compiler = Compiler::determine_from_file(&path).expect("Unknown extension");
             has_cpp |= compiler == Compiler::Cpp;
-            let compile_options = spec.required_compile_options.all(compiler).chain(env.profile.compile_options.all(compiler)).chain(self.compile_options.all(compiler));
+            let mut include_param = OsString::from("-I");
+            include_param.push(env.include_dir);
+            let include_param: PathBuf = include_param.into();
+            let compile_options = spec.required_compile_options
+                .all(compiler)
+                .chain(env.profile.compile_options.all(compiler))
+                .chain(self.compile_options.all(compiler))
+                .chain(std::iter::once(&include_param));
+
             let compiler = env.profile.compiler(compiler);
 
             if !std::process::Command::new(compiler)
@@ -408,7 +498,7 @@ impl<K: TargetKind> Target<K> {
                         print!(" {:?}", arg);
                     }
                     println!(" -c -o {:?} {:?}", output, path);
-                    return Err(io::ErrorKind::Other.into());
+                    return Err(io::Error::from(io::ErrorKind::Other).into());
             }
 
             if let Some(post_compile) = &env.project.post_compile {
@@ -426,7 +516,7 @@ impl<K: TargetKind> Target<K> {
                             print!(" {:?}", arg);
                         }
                         println!();
-                        return Err(io::ErrorKind::Other.into());
+                        return Err(io::Error::from(io::ErrorKind::Other).into());
                 }
             }
         }
@@ -448,6 +538,8 @@ fn link_using_compiler<CP: AsRef<OsStr>, OP: AsRef<Path>, O: AsRef<OsStr>, I: In
         .arg("-o")
         .arg(&output)
         .args(files.clone().into_iter().map(|(file, _)| objs::get_obj_path(&env.target_dir, &env.project_dir, unit_to_obj(file).unwrap())))
+        .args(env.lib_dirs)
+        .args(env.libs)
         .spawn()?
         .wait()?
         .success() {
@@ -473,7 +565,7 @@ pub struct Binary {
 }
 
 impl Binary {
-    pub fn build(&self, env: &BuildEnv) -> io::Result<()> {
+    pub fn build(&self, env: &BuildEnv) -> GocarResult<()> {
         let mut bin_path = env.target_dir.join(&self.target.name);
         bin_path.set_extension(&env.os.bin_spec.extension);
         let target_mtime = get_file_mtime(&bin_path)?;
@@ -491,7 +583,7 @@ impl Binary {
         };
 
         let link_options = env.os.bin_spec.required_link_options.iter().chain(&self.target.link_options);
-        link_using_compiler(compiler, bin_path, link_options, &compiled.files, env)
+        link_using_compiler(compiler, bin_path, link_options, &compiled.files, env).map_err(Into::into)
     }
 }
 
@@ -508,8 +600,10 @@ pub struct Library {
 }
 
 impl Library {
-    pub fn build(&self, env: &BuildEnv, linkage: LibraryType) -> io::Result<()> {
-        let mut lib_path = env.target_dir.join(&self.target.name);
+    pub fn build(&self, env: &BuildEnv, linkage: LibraryType) -> GocarResult<()> {
+        let mut lib_name = OsString::from("lib");
+        lib_name.push(&self.target.name);
+        let mut lib_path = env.target_dir.join(&lib_name);
         let lib_spec = match linkage {
             LibraryType::Dynamic => &env.os.dynamic_lib_spec,
             LibraryType::Static => &env.os.static_lib_spec,
@@ -536,6 +630,7 @@ impl Library {
             LibraryType::Dynamic => link_using_compiler(compiler, lib_path, link_options, &compiled.files, env),
             LibraryType::Static => Library::link_static(lib_path, link_options, &compiled.files, env),
         }
+        .map_err(Into::into)
     }
 
     fn link_static<OP: AsRef<Path>, O: AsRef<OsStr>, I: IntoIterator<Item=O> + Clone>(output: OP, options: I, files: &HashMap<PathBuf, Vec<PathBuf>>, env: &BuildEnv) -> io::Result<()> {
@@ -613,6 +708,13 @@ impl Profile {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct Dependency {
+    path: PathBuf,
+    #[serde(default)]
+    linkage: Option<LibraryType>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct DetachedHeaders {
     includes: PathBuf,
     sources: PathBuf,
@@ -642,9 +744,23 @@ pub struct Project {
     pub post_compile: Option<PathBuf>,
     #[serde(default)]
     pub headers_only: HashSet<PathBuf>,
+    #[serde(default)]
+    pub dependencies: HashMap<String, Dependency>,
 }
 
 impl Project {
+    pub fn load_from_dir<P: AsRef<Path>>(directory: P) -> GocarResult<Self> {
+        use std::io::Read;
+
+        let file_path = directory.as_ref().join("Gocar.toml");
+
+        let mut project_data = Vec::new();
+        file_open(file_path)?.read_to_end(&mut project_data)?;
+        let mut project = toml::from_slice::<Project>(&project_data).unwrap();
+        project.init_default_profiles();
+        Ok(project)
+    }
+
     pub fn init_default_profiles(&mut self) {
         self.profiles.entry("release".to_owned()).or_insert_with(Profile::release);
         self.profiles.entry("debug".to_owned()).or_insert_with(Profile::debug);
@@ -656,14 +772,53 @@ impl Project {
         }
     }
 
-    pub fn build<TP: AsRef<Path>, PP: AsRef<Path>>(&self, target_dir: TP, project_dir: PP, profile: &str) -> io::Result<()> {
-        let profile = self.profiles.get(profile).ok_or(io::ErrorKind::InvalidInput)?;
+    pub fn build_dependencies<TP: AsRef<Path>, PP: AsRef<Path>>(&self, target_dir: TP, project_dir: PP, profile_name: &str, linkage: LibraryType) -> GocarResult<(PathBuf, Vec<OsString>, Vec<OsString>)> {
+        let include_dir = [target_dir.as_ref(), "deps".as_ref(), "include".as_ref()].iter().collect::<PathBuf>();
+        let mut lib_dirs = Vec::with_capacity(self.dependencies.len());
+        let mut libs = Vec::with_capacity(self.dependencies.len());
+
+        for (dep_name, dep) in &self.dependencies {
+            let project = Project::load_from_dir(&dep.path)?;
+            let dep_lib_dir = [target_dir.as_ref(), "deps".as_ref(), "lib".as_ref(), dep_name.as_ref()].iter().collect::<PathBuf>();
+            let dep_include_dir = include_dir.join(&dep_name);
+            create_dir_all(&dep_lib_dir)?;
+            create_dir_all(&dep_include_dir)?;
+            let linkage = dep.linkage.unwrap_or(linkage);
+            if dep.path.is_relative() {
+                let dep_path = project_dir.as_ref().join(&dep.path);
+                project.build_libraries(&dep_lib_dir, &dep_path, profile_name, linkage)?;
+                project.copy_headers(dep_include_dir, &dep_path)?;
+            } else {
+                project.build_libraries(&dep_lib_dir, &dep.path, profile_name, linkage)?;
+                project.copy_headers(dep_include_dir, &dep.path)?;
+            }
+
+            let mut lib_dir = OsString::from("-L");
+            lib_dir.push(&dep_lib_dir);
+            lib_dirs.push(lib_dir);
+
+            for lib in &project.lib {
+                let mut lib_arg = OsString::from("-l");
+                lib_arg.push(&lib.target.name);
+                libs.push(lib_arg);
+            }
+        }
+
+        Ok((include_dir, lib_dirs, libs))
+    }
+
+    fn with_build_env<F: FnOnce(&BuildEnv) -> GocarResult<()>>(&self, target_dir: &Path, project_dir: &Path, profile_name: &str, linkage: LibraryType, f: F) -> GocarResult<()> {
+        let profile = self.profiles.get(profile_name).ok_or(Error::InvalidProfileName)?;
+        let (include_dir, lib_dirs, libs) = self.build_dependencies(target_dir, project_dir, profile_name, linkage)?;
         let strip_prefix = std::env::current_dir().unwrap_or_else(|_| PathBuf::new());
-        let headers_only = self.headers_only.iter().map(|path| path.canonicalize()).collect::<Result<_, _>>()?;
+        let headers_only = self.headers_only.iter().map(canonicalize).collect::<Result<_, _>>()?;
 
         let env = BuildEnv {
-            target_dir: target_dir.as_ref(),
-            project_dir: project_dir.as_ref(),
+            target_dir: target_dir,
+            project_dir: project_dir,
+            include_dir: &include_dir,
+            lib_dirs: &lib_dirs,
+            libs: &libs,
             profile,
             project: self,
             strip_prefix: &strip_prefix,
@@ -671,13 +826,47 @@ impl Project {
             os: OsSpec::linux(),
         };
 
+        f(&env)
+    }
+
+    fn build_libs(&self, env: &BuildEnv, linkage: LibraryType) -> GocarResult<()> {
         for lib in &self.lib {
-            lib.build(&env, LibraryType::Dynamic)?;
+            lib.build(&env, linkage)?;
         }
 
+        Ok(())
+    }
+
+    fn build_bins(&self, env: &BuildEnv) -> GocarResult<()> {
         for bin in &self.bin {
             bin.build(&env)?;
         }
+
+        Ok(())
+    }
+
+    pub fn build<TP: AsRef<Path>, PP: AsRef<Path>>(&self, target_dir: TP, project_dir: PP, profile_name: &str, linkage: LibraryType) -> GocarResult<()> {
+        self.with_build_env(target_dir.as_ref(), project_dir.as_ref(), profile_name, linkage, |env| {
+            self.build_libs(env, linkage)?;
+            self.build_bins(env)
+        })
+    }
+
+    pub fn build_libraries<TP: AsRef<Path>, PP: AsRef<Path>>(&self, target_dir: TP, project_dir: PP, profile_name: &str, linkage: LibraryType) -> GocarResult<()> {
+        self.with_build_env(target_dir.as_ref(), project_dir.as_ref(), profile_name, linkage, |env| {
+            self.build_libs(env, linkage)
+        })
+    }
+
+    pub fn copy_headers<TP: AsRef<Path>, PP:AsRef<Path>>(&self, target_dir: TP, project_dir: PP) -> GocarResult<()> {
+        for lib in &self.lib {
+            for header_relative in &lib.public_headers {
+                let header = [project_dir.as_ref(), "src".as_ref(), header_relative.as_ref()].iter().collect::<PathBuf>();
+                let dest = [target_dir.as_ref(), header_relative.file_name().unwrap().as_ref()].iter().collect::<PathBuf>();
+                std::fs::copy(&header, dest).err_ctx(|| (header, "copy file"))?;
+            }
+        }
+
         Ok(())
     }
 }

@@ -22,16 +22,16 @@ fn build(profile: &str) {
     let current_dir = std::env::current_dir().expect("Invalid current working directory");
 
     std::fs::create_dir_all(&target).unwrap();
-    config.build(&target, &current_dir, profile).unwrap();
+    config.build(&target, &current_dir, profile, gocar::LibraryType::Static).unwrap();
 }
 
-fn test(profile: &str) {
+fn test(profile_name: &str) {
     let config = load_config();
 
     let headers_only = config.headers_only.iter().map(|path| path.canonicalize()).collect::<Result<_, _>>().expect("Failed to canonicalize headers_only");
-    let mut target = AsRef::<std::path::Path>::as_ref("target").join(profile);
+    let mut target = AsRef::<std::path::Path>::as_ref("target").join(profile_name);
     target.push("integration_tests");
-    let profile = config.profiles.get(profile).expect("unknown profile");
+    let profile = config.profiles.get(profile_name).expect("unknown profile");
     //println!("Testing with profile: {:?}", profile);
 
     let mut test_count = 0;
@@ -40,6 +40,9 @@ fn test(profile: &str) {
     let current_dir = std::env::current_dir().expect("Invalid current working directory");
 
     std::fs::create_dir_all(&target).unwrap();
+
+    let (include_dir, lib_dirs, libs) = config.build_dependencies(&target, &current_dir, profile_name, gocar::LibraryType::Static).unwrap();
+
     for test in std::fs::read_dir("tests").unwrap().map(Result::unwrap).map(|e| e.path()) {
         let extension_is_valid = if let Some(extension) = test.extension() {
             extension == "c" || extension == "cpp"
@@ -64,6 +67,9 @@ fn test(profile: &str) {
 
             let env = gocar::BuildEnv {
                 target_dir: &target,
+                include_dir: &include_dir,
+                lib_dirs: &lib_dirs,
+                libs: &libs,
                 profile,
                 strip_prefix: &current_dir,
                 project_dir: &current_dir,
