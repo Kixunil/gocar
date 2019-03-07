@@ -75,6 +75,10 @@ fn file_open<P: AsRef<Path> + Into<PathBuf>>(path: P) -> FsResult<std::fs::File>
     std::fs::File::open(&path).err_ctx(|| (path.into(), "open file"))
 }
 
+fn copy_file<S: AsRef<Path> + Into<PathBuf>, D: AsRef<Path>>(source: S, dest: D) -> FsResult<u64> {
+    std::fs::copy(&source, dest).err_ctx(|| (source.into(), "copy file"))
+}
+
 fn create_dir_all<P: AsRef<Path> + Into<PathBuf>>(path: P) -> FsResult<()> {
     std::fs::create_dir_all(&path).err_ctx(|| (path.into(), "create directory structure"))
 }
@@ -86,10 +90,16 @@ fn canonicalize<P: AsRef<Path> + Into<PathBuf>>(path: P) -> FsResult<PathBuf> {
 fn canonicalize_custom_wd<P: AsRef<Path> + Into<PathBuf>, WD: AsRef<Path>>(path: P, working_dir: WD) -> FsResult<PathBuf> {
     if path.as_ref().is_relative() {
         let path = working_dir.as_ref().join(path);
-        path.canonicalize().err_ctx(|| (path, "canonicalize"))
+        Ok(path.canonicalize().err_ctx(|| (path, "canonicalize")).unwrap())
     } else {
-        path.as_ref().canonicalize().err_ctx(|| (path.into(), "canonicalize"))
+        Ok(path.as_ref().canonicalize().err_ctx(|| (path.into(), "canonicalize")).unwrap())
     }
+}
+
+fn include_option<P: AsRef<OsStr>>(dir: P) -> OsString {
+    let mut res = OsString::from("-I");
+    res.push(dir.as_ref());
+    res
 }
 
 struct HeaderExtractor<R: BufRead> {
@@ -488,9 +498,7 @@ impl<K: TargetKind> Target<K> {
             println!("   \u{1B}[32;1mCompiling\u{1B}[0m {:?}", output.strip_prefix(&env.strip_prefix).unwrap_or(&output));
             let compiler = Compiler::determine_from_file(&path).expect("Unknown extension");
             has_cpp |= compiler == Compiler::Cpp;
-            let mut include_param = OsString::from("-I");
-            include_param.push(env.include_dir);
-            let include_param: PathBuf = include_param.into();
+            let include_param: PathBuf = include_option(env.include_dir).into();
             let compile_options = spec.required_compile_options
                 .all(compiler)
                 .chain(env.profile.compile_options.all(compiler))
@@ -740,6 +748,29 @@ pub struct Dependency {
     path: PathBuf,
     #[serde(default)]
     linkage: Option<LibraryType>,
+    #[serde(default)]
+    config_headers: Vec<PathBuf>,
+}
+
+impl Dependency {
+    fn copy_config_headers<P: AsRef<Path>, D: AsRef<Path>>(&self, project_dir: P, dest: D, project: &mut Project) -> FsResult<()> {
+        for header in &self.config_headers {
+            let filename = header.file_name().expect("Missing header file name");
+            let dest = if header.is_relative() {
+                let header = project_dir.as_ref().join(header);
+                let dest = dest.as_ref().join(filename);
+                copy_file(header, &dest)?;
+                dest
+            } else {
+                let dest = dest.as_ref().join(filename);
+                copy_file(header, &dest)?;
+                dest
+            };
+            project.headers_only.insert(dest);
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -807,19 +838,28 @@ impl Project {
         let mut lib_dirs = Vec::with_capacity(self.dependencies.len());
         let mut libs = Vec::with_capacity(self.dependencies.len());
 
+        create_dir_all(&include_dir)?;
+        let include_dir = canonicalize(include_dir)?;
+
         for (dep_name, dep) in &self.dependencies {
-            let project = Project::load_from_dir(&dep.path)?;
+            let mut project = Project::load_from_dir(&dep.path)?;
             let dep_lib_dir = [target_dir.as_ref(), "deps".as_ref(), "lib".as_ref(), dep_name.as_ref()].iter().collect::<PathBuf>();
             let dep_include_dir = include_dir.join(&dep_name);
             create_dir_all(&dep_lib_dir)?;
             create_dir_all(&dep_include_dir)?;
+            let extra_include = if dep.config_headers.len() > 0 {
+                dep.copy_config_headers(&project_dir, &dep_include_dir, &mut project)?;
+                Some(&*dep_include_dir)
+            } else {
+                None
+            };
             let linkage = dep.linkage.unwrap_or(linkage);
             if dep.path.is_relative() {
                 let dep_path = project_dir.as_ref().join(&dep.path);
-                project.build_libraries(&dep_lib_dir, &dep_path, profile_name, linkage)?;
+                project.build_libraries(&dep_lib_dir, &dep_path, profile_name, linkage, extra_include)?;
                 project.copy_headers(dep_include_dir, &dep_path)?;
             } else {
-                project.build_libraries(&dep_lib_dir, &dep.path, profile_name, linkage)?;
+                project.build_libraries(&dep_lib_dir, &dep.path, profile_name, linkage, extra_include)?;
                 project.copy_headers(dep_include_dir, &dep.path)?;
             }
 
@@ -837,20 +877,20 @@ impl Project {
         Ok((include_dir, lib_dirs, libs))
     }
 
-    fn with_build_env<F: FnOnce(&BuildEnv) -> GocarResult<()>>(&self, target_dir: &Path, project_dir: &Path, profile_name: &str, linkage: LibraryType, f: F) -> GocarResult<()> {
+    fn with_build_env<F: FnOnce(&BuildEnv) -> GocarResult<()>>(&self, target_dir: &Path, project_dir: &Path, profile_name: &str, linkage: LibraryType, extra_include: Option<&Path>, f: F) -> GocarResult<()> {
         let profile = self.profiles.get(profile_name).ok_or(Error::InvalidProfileName)?;
         let (include_dir, lib_dirs, libs) = self.build_dependencies(target_dir, project_dir, profile_name, linkage)?;
         let strip_prefix = std::env::current_dir().unwrap_or_else(|_| PathBuf::new());
-        let headers_only = self.headers_only.iter().map(|path| canonicalize_custom_wd(path, project_dir)).collect::<Result<_, _>>()?;
-        let include_dirs = self.include_dirs
+        let headers_only = self.headers_only.iter().map(|path| canonicalize_custom_wd(path, project_dir)).collect::<Result<HashSet<_>, _>>()?;
+        let mut include_dirs = self.include_dirs
             .iter()
             .map(|path| canonicalize_custom_wd(path, project_dir))
-            .map(|dir| dir.map(|dir| {
-                let mut opt = OsString::from("-I");
-                opt.push(dir);
-                opt
-            }))
+            .map(|dir| dir.map(include_option))
             .collect::<Result<Vec<_>, _>>()?;
+
+        if let Some(extra_include) = extra_include {
+            include_dirs.push(include_option(extra_include));
+        }
 
         let env = BuildEnv {
             target_dir: target_dir,
@@ -886,14 +926,14 @@ impl Project {
     }
 
     pub fn build<TP: AsRef<Path>, PP: AsRef<Path>>(&self, target_dir: TP, project_dir: PP, profile_name: &str, linkage: LibraryType) -> GocarResult<()> {
-        self.with_build_env(target_dir.as_ref(), project_dir.as_ref(), profile_name, linkage, |env| {
+        self.with_build_env(target_dir.as_ref(), project_dir.as_ref(), profile_name, linkage, None, |env| {
             self.build_libs(env, linkage)?;
             self.build_bins(env)
         })
     }
 
-    pub fn build_libraries<TP: AsRef<Path>, PP: AsRef<Path>>(&self, target_dir: TP, project_dir: PP, profile_name: &str, linkage: LibraryType) -> GocarResult<()> {
-        self.with_build_env(target_dir.as_ref(), project_dir.as_ref(), profile_name, linkage, |env| {
+    pub fn build_libraries<TP: AsRef<Path>, PP: AsRef<Path>>(&self, target_dir: TP, project_dir: PP, profile_name: &str, linkage: LibraryType, extra_include: Option<&Path>) -> GocarResult<()> {
+        self.with_build_env(target_dir.as_ref(), project_dir.as_ref(), profile_name, linkage, extra_include, |env| {
             self.build_libs(env, linkage)
         })
     }
