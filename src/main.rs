@@ -24,15 +24,8 @@ fn build(profile: &str) {
     std::fs::create_dir_all(&target).unwrap();
     match config.build(&target, &current_dir, profile, gocar::LibraryType::Static) {
         Ok(()) => (),
-        Err(gocar::Error::CompileError(cmdline)) => {
-            print!("      \u{1B}[31;1mFailed\u{1B}[0m");
-            for arg in &cmdline {
-                print!(" {:?}", arg);
-            }
-            println!();
-        },
+        Err(gocar::Error::Command(err)) => println!("      \u{1B}[31;1mError\u{1B}[0m: {}", err),
         Err(gocar::Error::Filesystem(err)) => println!("      \u{1B}[31;1mError\u{1B}[0m: {}", err),
-        Err(gocar::Error::Unspecified(err)) => println!("      \u{1B}[31;1mError\u{1B}[0m: {}", err),
         Err(gocar::Error::InvalidProfileName) => println!("      \u{1B}[31;1mError\u{1B}[0m: invalid profile name"),
     }
 }

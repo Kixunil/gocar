@@ -30,20 +30,149 @@ type FsResult<T> = Result<T, FsError>;
 #[derive(Debug)]
 pub enum Error {
     Filesystem(FsError),
-    Unspecified(io::Error),
     InvalidProfileName,
-    CompileError(Vec<OsString>),
-}
-
-impl From<io::Error> for Error {
-    fn from(value: io::Error) -> Error {
-       Error::Unspecified(value)
-    }
+    Command(CommandError),
 }
 
 impl From<FsError> for Error {
     fn from(value: FsError) -> Error {
        Error::Filesystem(value)
+    }
+}
+
+impl From<CommandError> for Error {
+    fn from(value: CommandError) -> Self {
+        Error::Command(value)
+    }
+}
+
+
+pub struct CmdOperationError {
+    command: Command,
+    error: io::Error,
+}
+
+pub struct ExitStatus {
+    command: Command,
+    status: std::process::ExitStatus,
+}
+
+impl ExitStatus {
+    pub fn failure_into_error(self) -> Result<(), CommandError> {
+        if self.status.success() {
+            Ok(())
+        } else {
+            Err(CommandError::Failed(self))
+        }
+    }
+
+    pub fn success(&self) -> bool {
+        self.status.success()
+    }
+}
+
+impl fmt::Display for ExitStatus {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self.status.code() {
+            Some(code) => write!(f, "command {} returned exit code {}", self.command, code),
+            None => write!(f, "command {} was killed by a signal", self.command),
+        }
+    }
+}
+
+pub enum CommandError {
+    Spawn(CmdOperationError),
+    Wait(CmdOperationError),
+    Failed(ExitStatus),
+    Communication(CmdOperationError),
+}
+
+impl fmt::Display for CommandError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            CommandError::Spawn(error) => write!(f, "failed to run command {}: {}", error.command, error.error),
+            CommandError::Wait(error) => write!(f, "failed to wait for command {}: {}", error.command, error.error),
+            CommandError::Failed(status) => fmt::Display::fmt(status, f),
+            CommandError::Communication(error) => write!(f, "failed to communicate with command {}: {}", error.command, error.error),
+        }
+    }
+}
+
+impl fmt::Debug for CommandError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
+
+struct Command {
+    cmd: PathBuf,
+    args: Vec<OsString>,
+    piped_stdout: bool,
+}
+
+impl Command {
+    fn new<P: Into<PathBuf>>(path: P) -> Self {
+        Command {
+            cmd: path.into(),
+            args: Vec::new(),
+            piped_stdout: false,
+        }
+    }
+
+    fn arg<A: Into<OsString>>(mut self, arg: A) -> Self {
+        self.args.push(arg.into());
+        self
+    }
+
+    fn args<I>(mut self, args: I) -> Self where I: IntoIterator, <I as IntoIterator>::Item: Into<OsString> {
+        self.args.extend(args.into_iter().map(Into::into));
+        self
+    }
+
+    fn piped_stdout(mut self) -> Self {
+        self.piped_stdout = true;
+        self
+    }
+
+    fn spawn(self) -> Result<Child, CommandError> {
+        let mut command = std::process::Command::new(&self.cmd);
+
+        command.args(&self.args);
+
+        if self.piped_stdout {
+            command.stdout(std::process::Stdio::piped());
+        }
+
+        match command.spawn() {
+            Ok(child) => Ok(Child { command: self, child, }),
+            Err(error) => Err(CommandError::Spawn(CmdOperationError { command: self, error, })),
+        }
+    }
+}
+
+impl fmt::Display for Command {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{:?}", self.cmd)?;
+        for arg in &self.args {
+            write!(f, " {:?}", arg)?;
+        }
+
+        Ok(())
+    }
+}
+
+struct Child {
+    command: Command,
+    child: std::process::Child,
+}
+
+impl Child {
+    fn wait(mut self) -> Result<ExitStatus, CommandError> {
+        match self.child.wait() {
+            Ok(status) => Ok(ExitStatus { command: self.command, status }),
+            Err(error) => Err(CommandError::Wait(CmdOperationError { command: self.command, error, })),
+        }
     }
 }
 
@@ -188,27 +317,24 @@ fn get_headers<P: AsRef<Path> + Into<PathBuf>>(file: P, env: &BuildEnv) -> Gocar
     let options = env.profile.compile_options.all(compiler);
     let compiler = env.profile.compiler(compiler);
 
-    let mut cpp = std::process::Command::new(compiler)
+    let mut cpp = Command::new(compiler)
         .args(env.include_dirs)
         .args(options.clone())
         .arg("-MM")
         .arg(file.as_ref())
-        .stdout(std::process::Stdio::piped())
+        .piped_stdout()
         .spawn()?;
 
-    let headers = HeaderExtractor::new(io::BufReader::new(cpp.stdout.take().expect("Stdout not set")));
-    let headers = headers.collect::<Result<_, _>>().map_err(Into::into);
-    if !cpp.wait()?.success() {
-        let (min, max) = options.size_hint();
-        let size = max.unwrap_or(min);
-        let mut cmdline: Vec<OsString> = Vec::with_capacity(size + 3);
-        cmdline.push(compiler.into());
-        cmdline.extend(env.include_dirs.iter().map(Into::into));
-        cmdline.extend(options.map(Into::into));
-        cmdline.push("-MM".into());
-        cmdline.push(file.into().into());
-        return Err(Error::CompileError(cmdline));
-    }
+    let headers = HeaderExtractor::new(io::BufReader::new(cpp.child.stdout.take().expect("Stdout not set")));
+    let headers = match headers.collect::<Result<_, _>>() {
+        Ok(headers) => Ok(headers),
+        Err(error) => return Err(CommandError::Communication(CmdOperationError {
+            command: cpp.command,
+            error,
+        }).into()),
+    };
+
+    cpp.wait()?.failure_into_error()?;
     headers
 }
 
@@ -260,10 +386,12 @@ fn scan_c_files<P: AsRef<Path> + Into<PathBuf>, I: IntoIterator<Item=P>>(root_fi
     Ok(scanned_files)
 }
 
-fn is_older<P: AsRef<Path>, I: Iterator<Item=P>>(time: SystemTime, files: I) -> io::Result<bool> {
+fn is_older<P: AsRef<Path>, I: Iterator<Item=P>>(time: SystemTime, files: I) -> FsResult<bool> {
     for file in files {
-        if std::fs::metadata(&file)?.modified()? > time {
-            return Ok(true);
+        match get_file_mtime(&file)? {
+            Some(mtime) if mtime > time => return Ok(true),
+            Some(_) => (),
+            None => return Ok(true),
         }
     }
 
@@ -294,7 +422,7 @@ fn get_file_mtime<P: AsRef<Path>>(file: P) -> FsResult<Option<SystemTime>> {
 }
 
 impl<'a> Iterator for ModifiedSources<'a> {
-    type Item = io::Result<&'a Path>;
+    type Item = FsResult<&'a Path>;
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
@@ -507,7 +635,7 @@ impl<K: TargetKind> Target<K> {
 
             let compiler = env.profile.compiler(compiler);
 
-            if !std::process::Command::new(compiler)
+            Command::new(compiler)
                 .args(env.include_dirs)
                 .args(compile_options.clone())
                 .arg("-c")
@@ -516,24 +644,11 @@ impl<K: TargetKind> Target<K> {
                 .arg(path)
                 .spawn()?
                 .wait()?
-                .success() {
-                    let (min, max) = compile_options.size_hint();
-                    let len = max.unwrap_or(min) + env.include_dirs.len() + 5;
-                    let mut cmdline: Vec<OsString> = Vec::with_capacity(len);
-                    cmdline.push(compiler.into());
-                    cmdline.extend(env.include_dirs.iter().map(Into::into));
-                    cmdline.extend(compile_options.clone().map(Into::into));
-                    cmdline.push("-c".into());
-                    cmdline.push("-o".into());
-                    cmdline.push(output.into());
-                    cmdline.push(path.into());
-
-                    return Err(Error::CompileError(cmdline));
-            }
+                .failure_into_error()?;
 
             if let Some(post_compile) = &env.project.post_compile {
                 println!("\u{1B}[32;1mPost compile\u{1B}[0m {:?}", output.strip_prefix(&env.strip_prefix).unwrap_or(&output));
-                if !std::process::Command::new(post_compile)
+                Command::new(post_compile)
                     .arg(&output)
                     .arg(path)
                     .arg(compiler)
@@ -541,19 +656,7 @@ impl<K: TargetKind> Target<K> {
                     .args(compile_options.clone())
                     .spawn()?
                     .wait()?
-                    .success() {
-                        let (min, max) = compile_options.size_hint();
-                        let len = max.unwrap_or(min) + env.include_dirs.len() + 4;
-                        let mut cmdline: Vec<OsString> = Vec::with_capacity(len);
-                        cmdline.push(post_compile.into());
-                        cmdline.push(output.into());
-                        cmdline.push(path.into());
-                        cmdline.push(compiler.into());
-                        cmdline.extend(env.include_dirs.iter().map(Into::into));
-                        cmdline.extend(compile_options.clone().map(Into::into));
-
-                        return Err(Error::CompileError(cmdline));
-                }
+                    .failure_into_error()?;
             }
         }
 
@@ -565,12 +668,12 @@ impl<K: TargetKind> Target<K> {
     }
 }
 
-fn link_using_compiler<CP: AsRef<OsStr>, OP: AsRef<Path>, O: AsRef<OsStr>, I: IntoIterator<Item=O> + Clone>(compiler: CP, output: OP, options: I, files: &HashMap<PathBuf, Vec<PathBuf>>, env: &BuildEnv) -> io::Result<()> {
+fn link_using_compiler<CP: AsRef<OsStr>, OP: AsRef<Path>, O: Into<OsString>, I: IntoIterator<Item=O>>(compiler: CP, output: OP, options: I, files: &HashMap<PathBuf, Vec<PathBuf>>, env: &BuildEnv) -> Result<(), CommandError> {
     let output = output.as_ref();
 
     println!("     \u{1B}[32;1mLinking\u{1B}[0m {:?}", output.strip_prefix(&env.strip_prefix).unwrap_or(&output));
-    if std::process::Command::new(&compiler)
-        .args(options.clone())
+    Command::new(&compiler)
+        .args(options)
         .arg("-o")
         .arg(&output)
         .args(files.clone().into_iter().map(|(file, _)| objs::get_obj_path(&env.target_dir, &env.project_dir, unit_to_obj(file).unwrap())))
@@ -578,20 +681,7 @@ fn link_using_compiler<CP: AsRef<OsStr>, OP: AsRef<Path>, O: AsRef<OsStr>, I: In
         .args(env.libs)
         .spawn()?
         .wait()?
-        .success() {
-            Ok(())
-    } else {
-        print!("      \u{1B}[31;1mFailed\u{1B}[0m {:?}", compiler.as_ref());
-        for arg in options {
-            print!(" {:?}", arg.as_ref());
-        }
-        print!(" -o {:?}", output);
-        for file in files.into_iter().map(|(file, _)| objs::get_obj_path(&env.target_dir, &env.project_dir, unit_to_obj(file).unwrap())) {
-            print!(" {:?}", file);
-        }
-        println!();
-        Err(io::ErrorKind::Other.into())
-    }
+        .failure_into_error()
 }
 
 #[derive(Debug, Deserialize)]
@@ -669,7 +759,7 @@ impl Library {
         .map_err(Into::into)
     }
 
-    fn link_static<OP: AsRef<Path>, O: AsRef<OsStr>, I: IntoIterator<Item=O> + Clone>(output: OP, options: I, files: &HashMap<PathBuf, Vec<PathBuf>>, env: &BuildEnv) -> io::Result<()> {
+    fn link_static<OP: AsRef<Path>, O: AsRef<OsStr>, I: IntoIterator<Item=O> + Clone>(output: OP, options: I, files: &HashMap<PathBuf, Vec<PathBuf>>, env: &BuildEnv) -> Result<(), CommandError> {
         let output = output.as_ref();
         let mut args: OsString = "crs".into();
         for arg in options {
@@ -677,22 +767,13 @@ impl Library {
         }
 
         println!("     \u{1B}[32;1mLinking\u{1B}[0m {:?}", output.strip_prefix(&env.strip_prefix).unwrap_or(&output));
-        if std::process::Command::new("ar")
+        Command::new("ar")
             .arg(&args)
             .arg(&output)
             .args(files.clone().into_iter().map(|(file, _)| objs::get_obj_path(&env.target_dir, &env.project_dir, unit_to_obj(file).unwrap())))
             .spawn()?
             .wait()?
-            .success() {
-                Ok(())
-        } else {
-            print!("      \u{1B}[31;1mFailed\u{1B}[0m ar {:?}", &args);
-            for file in files.into_iter().map(|(file, _)| objs::get_obj_path(&env.target_dir, &env.project_dir, unit_to_obj(file).unwrap())) {
-                print!(" {:?}", file);
-            }
-            println!();
-            Err(io::ErrorKind::Other.into())
-        }
+            .failure_into_error()
     }
 }
 
@@ -816,7 +897,7 @@ impl Project {
         let file_path = directory.as_ref().join("Gocar.toml");
 
         let mut project_data = Vec::new();
-        file_open(file_path)?.read_to_end(&mut project_data)?;
+        file_open(&file_path)?.read_to_end(&mut project_data).err_ctx(|| (file_path, "read file"))?;
         let mut project = toml::from_slice::<Project>(&project_data).unwrap();
         project.init_default_profiles();
         Ok(project)
