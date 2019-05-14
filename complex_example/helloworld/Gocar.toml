@@ -1,3 +1,5 @@
+estimate_headers_only = true
+
 [[bin]]
 name = "helloworld"
 root_files = ["src/main.c"]

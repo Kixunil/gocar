@@ -338,6 +338,18 @@ fn get_headers<P: AsRef<Path> + Into<PathBuf>>(file: P, env: &BuildEnv) -> Gocar
     headers
 }
 
+fn estimate_header_only<P: AsRef<Path>>(path: P, env: &BuildEnv, compiler: Compiler) -> Result<bool, CommandError> {
+    let options = env.profile.compile_options.all(compiler);
+
+    Ok(Command::new("is_header_only.py")
+        .arg(path.as_ref())
+        .args(env.include_dirs)
+        .args(options.clone())
+        .spawn()?
+        .wait()?
+        .success())
+}
+
 /// Scans files in the project
 fn scan_c_files<P: AsRef<Path> + Into<PathBuf>, I: IntoIterator<Item=P>>(root_files: I, ignore_files: &HashSet<PathBuf>, env: &BuildEnv) -> GocarResult<HashMap<PathBuf, Vec<PathBuf>>> {
         let detached_headers = env.project.detached_headers.iter().map(|mapping| Ok(DetachedHeaders { includes: canonicalize_custom_wd(&mapping.includes, env.project_dir)?, sources: canonicalize_custom_wd(&mapping.sources, env.project_dir)?})).collect::<FsResult<Vec<_>>>()?;
@@ -362,7 +374,21 @@ fn scan_c_files<P: AsRef<Path> + Into<PathBuf>, I: IntoIterator<Item=P>>(root_fi
                 } else {
                     let unit = header_to_unit(canonicalized, &detached_headers);
                     if !env.project.ignore_missing_sources && unit.is_none() {
-                        panic!("Missing source for header {:?}", header)
+                        let is_ok = if env.project.estimate_headers_only {
+                            match estimate_header_only(header, env, Compiler::Cpp) {
+                                Ok(val) => val,
+                                Err(err) => {
+                                    eprintln!("Error: failed to estimate whether {} is header-only: {}", header.display(), err);
+                                    false
+                                },
+                            }
+                        } else {
+                            false
+                        };
+
+                        if !is_ok {
+                            panic!("Missing source for header {}", header.display())
+                        }
                     }
                     unit
                 }
@@ -878,6 +904,8 @@ pub struct Project {
     pub add_link_options: Vec<PathBuf>,
     #[serde(default)]
     pub ignore_missing_sources: bool,
+    #[serde(default)]
+    pub estimate_headers_only: bool,
     #[serde(default)]
     pub detached_headers: Vec<DetachedHeaders>,
     #[serde(default)]
